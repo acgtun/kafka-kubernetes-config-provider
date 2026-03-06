@@ -24,21 +24,40 @@ jobs:
     name: Build Kafka Kubernetes Config Provider
     strategy:
       matrix:
-        javaVersion:
-          - "11"
-          - "17"
+        java:
+          - version: "11"
+            mainBuild: false
+          - version: "17"
+            mainBuild: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: ./.github/actions/build/build-binaries
-        env:
-          # The following env vars are set just to bypass current script config for all branches
-          # We will remove it in near future with removing Azure and using standard build scheme for all repos
-          BUILD_REASON: "PR"
-          BRANCH: "PR"
+
+      - name: Setup Java and Maven
+        uses: strimzi/github-actions/.github/actions/dependencies/setup-java@main
         with:
-          javaVersion: ${{ matrix.javaVersion }}
-          runnerArch: "amd64"
+          javaVersion: ${{ matrix.java.version }}
+
+      - name: Setup Kind cluster
+        uses: strimzi/github-actions/.github/actions/dependencies/setup-kind@main
+        with:
+          controlNodes: 1
+          workerNodes: 1
+          kindVersion: 0.31.0
+        env:
+          KIND_NODE_IMAGE: "latest"
+
+      # ITs requires to have set default namespace in kubeconfig which is not by default with Kind
+      - name: Set default namespace
+        shell: bash
+        run: kubectl config set-context --current --namespace=default
+
+      - name: Build binaries using build-binaries action
+        uses: strimzi/github-actions/.github/actions/build/build-binaries@main
+        with:
+          mainJavaBuild: ${{ matrix.java.mainBuild }}
+          artifactSuffix: "kafka-kubernetes-config-provider"
+          clusterOperatorBuild: "false"
 
   deploy-java:
     name: Deploy Java artifacts
@@ -48,10 +67,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: ./.github/actions/build/deploy-java
+
+      - name: Setup Java and Maven
+        uses: strimzi/github-actions/.github/actions/dependencies/setup-java@main
         with:
-          javaVersion: "11"
-          runnerArch: "amd64"
+          javaVersion: "17"
+
+      - name: Deploy to Maven Central
+        uses: strimzi/github-actions/.github/actions/build/deploy-java@main
+        with:
+          modules: "./"
           gpgPassphrase: ${{ secrets.GPG_PASSPHRASE }}
           gpgSigningKey: ${{ secrets.GPG_SIGNING_KEY }}
           centralUsername: ${{ secrets.CENTRAL_USERNAME }}
