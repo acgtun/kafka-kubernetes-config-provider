@@ -21,10 +21,12 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.nio.file.FileSystems;
 import java.nio.file.PathMatcher;
 import java.nio.file.Paths;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
@@ -43,12 +45,15 @@ abstract class AbstractKubernetesConfigProvider<T extends HasMetadata, L extends
 
     // Configuration property names for retry behavior. Overridable via Kafka Connect's
     // `config.providers.<name>.param.<...>` mechanism so operators can tune without recompiling.
+    //
+    // Semantics: `max.retries = N` means N retries AFTER the initial attempt, for a total of
+    // N+1 attempts. With the defaults (N=5, 200ms..5s backoff) the worst-case startup latency
+    // is the sum of 5 sleeps capped at 5s ≈ 200+400+800+1600+3200 ≈ 6.2s, which fits under
+    // Kafka Connect's default config-provider timeout.
     static final String MAX_RETRIES_CONFIG_NAME = "max.retries";
     static final String INITIAL_BACKOFF_MS_CONFIG_NAME = "retry.backoff.ms";
     static final String MAX_BACKOFF_MS_CONFIG_NAME = "retry.backoff.max.ms";
 
-    // Defaults: 5 attempts with 200ms..5s backoff bounds the startup latency at ~6s worst case,
-    // which fits comfortably under Connect's default config-provider timeout.
     static final int DEFAULT_MAX_RETRIES = 5;
     static final long DEFAULT_INITIAL_BACKOFF_MS = 200L;
     static final long DEFAULT_MAX_BACKOFF_MS = 5_000L;
@@ -94,11 +99,31 @@ abstract class AbstractKubernetesConfigProvider<T extends HasMetadata, L extends
             separator = (String) config.get(SEPARATOR_CONFIG_NAME);
         }
 
-        maxRetries = parseIntConfig(config, MAX_RETRIES_CONFIG_NAME, DEFAULT_MAX_RETRIES, 1, 50);
-        initialBackoffMs = parseLongConfig(config, INITIAL_BACKOFF_MS_CONFIG_NAME, DEFAULT_INITIAL_BACKOFF_MS, 1L, 60_000L);
-        maxBackoffMs = parseLongConfig(config, MAX_BACKOFF_MS_CONFIG_NAME, DEFAULT_MAX_BACKOFF_MS, initialBackoffMs, 600_000L);
+        parseRetryConfig(config);
 
         client = new KubernetesClientBuilder().build();
+    }
+
+    /**
+     * Parses and validates the retry-related configuration keys. Single source of truth for
+     * both production ({@link #configure(Map)}) and the test seam ({@link #configureRetryForTest(Map)}),
+     * so future changes don't drift between the two.
+     */
+    private void parseRetryConfig(Map<String, ?> config) {
+        maxRetries = parseIntConfig(config, MAX_RETRIES_CONFIG_NAME, DEFAULT_MAX_RETRIES, 1, 50);
+        initialBackoffMs = parseLongConfig(config, INITIAL_BACKOFF_MS_CONFIG_NAME, DEFAULT_INITIAL_BACKOFF_MS, 1L, 60_000L);
+        // Parse max independently of initial so we can give a clearer error message when the
+        // user sets max < initial (parseLongConfig would otherwise log a generic "outside [min,max]").
+        long parsedMax = parseLongConfig(config, MAX_BACKOFF_MS_CONFIG_NAME, DEFAULT_MAX_BACKOFF_MS, 1L, 600_000L);
+        if (parsedMax < initialBackoffMs) {
+            LOG.warn("Config '{}' value {} is less than '{}' value {}; using default {} for the max backoff.",
+                    MAX_BACKOFF_MS_CONFIG_NAME, parsedMax,
+                    INITIAL_BACKOFF_MS_CONFIG_NAME, initialBackoffMs,
+                    DEFAULT_MAX_BACKOFF_MS);
+            maxBackoffMs = Math.max(DEFAULT_MAX_BACKOFF_MS, initialBackoffMs);
+        } else {
+            maxBackoffMs = parsedMax;
+        }
     }
 
     @Override
@@ -194,12 +219,15 @@ abstract class AbstractKubernetesConfigProvider<T extends HasMetadata, L extends
      * Decides whether the failed call should be retried. Returns true only if the exception is
      * classified as transient AND we have remaining retry budget.
      *
+     * `maxRetries` is the number of retries AFTER the initial attempt, so we allow another
+     * attempt whenever `attempt <= maxRetries` (i.e. up to `maxRetries + 1` total attempts).
+     *
      * @param e         The exception thrown by the Kubernetes client
      * @param attempt   The just-completed attempt number (1-indexed)
      * @return          true if another attempt should be made
      */
     boolean shouldRetry(KubernetesClientException e, int attempt) {
-        return attempt < maxRetries && isTransient(e);
+        return attempt <= maxRetries && isTransient(e);
     }
 
     /**
@@ -212,42 +240,64 @@ abstract class AbstractKubernetesConfigProvider<T extends HasMetadata, L extends
      * @return true if the error appears to be a recoverable network or server-side condition
      */
     boolean isTransient(KubernetesClientException e) {
-        // 1. Structured: retryable HTTP status codes.
-        int code = e.getCode();
-        if (code == 408   // Request Timeout
-                || code == 429   // Too Many Requests
-                || code == 500   // Internal Server Error
-                || code == 502   // Bad Gateway
-                || code == 503   // Service Unavailable
-                || code == 504) { // Gateway Timeout
+        if (isRetryableHttpCode(e.getCode())) {
             return true;
         }
-
-        // 2. Structured: walk the cause chain for transport-level exception types.
+        // Walk the cause chain for transport-level exception types or a GOAWAY message.
         for (Throwable cause = e; cause != null; cause = cause.getCause()) {
-            if (cause instanceof SocketException
-                    || cause instanceof SocketTimeoutException
-                    || cause instanceof EOFException) {
-                return true;
-            }
-            // 3. Last resort: GOAWAY is reported as a generic IOException from the JDK HTTP client.
-            // We deliberately keep this narrow to avoid swallowing real errors (e.g. auth failures
-            // that may also produce IOExceptions in some fabric8 code paths).
-            if (cause instanceof IOException && cause.getMessage() != null
-                    && cause.getMessage().contains("GOAWAY")) {
+            if (isTransientCause(cause)) {
                 return true;
             }
         }
         return false;
     }
 
+    /**
+     * Retryable HTTP status codes: request timeout, throttling, and the 5xx server-side errors
+     * we know to be transient.
+     */
+    private static boolean isRetryableHttpCode(int code) {
+        switch (code) {
+            case 408: // Request Timeout
+            case 429: // Too Many Requests
+            case 500: // Internal Server Error
+            case 502: // Bad Gateway
+            case 503: // Service Unavailable
+            case 504: // Gateway Timeout
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Classifies a single Throwable in the cause chain. SocketException covers ConnectException
+     * and friends; UnknownHostException covers DNS hiccups during apiserver / load-balancer
+     * failover. GOAWAY is matched only on IOException to stay narrow — auth failures and other
+     * permanent errors also surface as IOException in some fabric8 code paths.
+     */
+    private static boolean isTransientCause(Throwable cause) {
+        if (cause instanceof SocketException
+                || cause instanceof SocketTimeoutException
+                || cause instanceof UnknownHostException
+                || cause instanceof EOFException) {
+            return true;
+        }
+        // Case-insensitive match in case the JDK ever rewords the message.
+        return cause instanceof IOException
+                && cause.getMessage() != null
+                && cause.getMessage().toUpperCase(Locale.ROOT).contains("GOAWAY");
+    }
+
     private void sleepBeforeRetry(int attempt, KubernetesResourceIdentifier id, KubernetesClientException cause) {
         // Exponential backoff with full jitter: random in [base/2, base) to avoid thundering herd.
+        // Cap the left shift at 30 to keep the multiplier inside positive long range even if a
+        // future change raises the maxRetries upper bound above 31.
         long base = Math.min(initialBackoffMs * (1L << Math.min(attempt - 1, 30)), maxBackoffMs);
         long backoff = ThreadLocalRandom.current().nextLong(Math.max(1L, base / 2), Math.max(2L, base));
 
         LOG.warn("Transient error retrieving {} {} from namespace {} (attempt {}/{}): {}. Retrying in {} ms.",
-                kind, id.getName(), id.getNamespace(), attempt, maxRetries, cause.getMessage(), backoff);
+                kind, id.getName(), id.getNamespace(), attempt, maxRetries + 1, cause.getMessage(), backoff);
 
         try {
             sleeper.sleep(backoff);
@@ -333,12 +383,10 @@ abstract class AbstractKubernetesConfigProvider<T extends HasMetadata, L extends
 
     /**
      * Visible-for-testing helper that applies retry-related configuration without constructing a
-     * real KubernetesClient. Allows unit tests to instantiate provider subclasses with a chosen
-     * retry budget while bypassing the side effects of {@link #configure(Map)}.
+     * real KubernetesClient. Delegates to {@link #parseRetryConfig(Map)} so the parsing logic
+     * stays in a single place.
      */
     void configureRetryForTest(Map<String, ?> config) {
-        maxRetries = parseIntConfig(config, MAX_RETRIES_CONFIG_NAME, DEFAULT_MAX_RETRIES, 1, 50);
-        initialBackoffMs = parseLongConfig(config, INITIAL_BACKOFF_MS_CONFIG_NAME, DEFAULT_INITIAL_BACKOFF_MS, 1L, 60_000L);
-        maxBackoffMs = parseLongConfig(config, MAX_BACKOFF_MS_CONFIG_NAME, DEFAULT_MAX_BACKOFF_MS, initialBackoffMs, 600_000L);
+        parseRetryConfig(config);
     }
 }

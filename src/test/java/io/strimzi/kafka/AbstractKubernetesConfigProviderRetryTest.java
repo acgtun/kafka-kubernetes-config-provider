@@ -17,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import java.io.EOFException;
 import java.io.IOException;
 import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.HashMap;
@@ -99,6 +100,21 @@ class AbstractKubernetesConfigProviderRetryTest {
     }
 
     @Test
+    void unknownHostExceptionInCauseChainIsTransient() {
+        // DNS hiccups during apiserver / load-balancer failover.
+        KubernetesClientException e = new KubernetesClientException("wrap",
+                new UnknownHostException("kubernetes.default.svc"));
+        assertTrue(provider.isTransient(e));
+    }
+
+    @Test
+    void goawayMatchIsCaseInsensitive() {
+        KubernetesClientException e = new KubernetesClientException("wrap",
+                new IOException("/10.0.0.1:8443: goaway received"));
+        assertTrue(provider.isTransient(e));
+    }
+
+    @Test
     void plainIOExceptionWithoutGoawayIsNotTransient() {
         // Deliberately narrow: we don't retry on every IOException because auth failures and
         // other real errors also surface as IOExceptions in some fabric8 code paths.
@@ -142,16 +158,17 @@ class AbstractKubernetesConfigProviderRetryTest {
     @Test
     void exhaustsRetriesThenThrowsConfigExceptionPreservingCause() {
         KubernetesClientException last = transient503();
+        // maxRetries=3 means 3 retries AFTER the initial attempt: 4 total attempts, 3 sleeps.
         Queued queued = new Queued()
                 .enqueue(transientGoaway())
                 .enqueue(transient503())
+                .enqueue(transientGoaway())
                 .enqueue(last);
 
         ConfigException ce = assertThrows(ConfigException.class,
                 () -> provider.getResourceWithRetry(id(), queued));
 
-        // maxRetries=3 → attempts 1,2 sleep; attempt 3 fails and is not retried.
-        assertEquals(2, sleepCount.get(), "Should sleep maxRetries-1 times");
+        assertEquals(3, sleepCount.get(), "Should sleep maxRetries times before giving up");
         assertNotNull(ce.getCause(), "Cause must be preserved for debugging");
         assertSame(last, ce.getCause());
     }
@@ -182,17 +199,18 @@ class AbstractKubernetesConfigProviderRetryTest {
     @Test
     void backoffIsBoundedByMax() {
         TestProvider tp = new TestProvider();
+        // maxRetries=20 → 21 total attempts, 20 sleeps.
         tp.configureRetryForTest(Map.of(
                 AbstractKubernetesConfigProvider.MAX_RETRIES_CONFIG_NAME, "20",
                 AbstractKubernetesConfigProvider.INITIAL_BACKOFF_MS_CONFIG_NAME, "1",
                 AbstractKubernetesConfigProvider.MAX_BACKOFF_MS_CONFIG_NAME, "50"
         ));
-        long[] observed = new long[19];
+        long[] observed = new long[20];
         AtomicInteger idx = new AtomicInteger();
         tp.setSleeper(ms -> observed[idx.getAndIncrement()] = ms);
 
         Queued queued = new Queued();
-        for (int i = 0; i < 20; i++) {
+        for (int i = 0; i < 21; i++) {
             queued.enqueue(transientGoaway());
         }
 
@@ -231,6 +249,42 @@ class AbstractKubernetesConfigProviderRetryTest {
         assertEquals(AbstractKubernetesConfigProvider.DEFAULT_INITIAL_BACKOFF_MS, tp.getInitialBackoffMs());
     }
 
+    @Test
+    void maxBackoffLessThanInitialFallsBackToDefault() {
+        TestProvider tp = new TestProvider();
+        tp.configureRetryForTest(Map.of(
+                AbstractKubernetesConfigProvider.INITIAL_BACKOFF_MS_CONFIG_NAME, "5000",
+                AbstractKubernetesConfigProvider.MAX_BACKOFF_MS_CONFIG_NAME, "3000"
+        ));
+
+        assertEquals(5000L, tp.getInitialBackoffMs());
+        // max < initial: fall back to DEFAULT_MAX_BACKOFF_MS (or initial if larger).
+        long expected = Math.max(AbstractKubernetesConfigProvider.DEFAULT_MAX_BACKOFF_MS, tp.getInitialBackoffMs());
+        assertEquals(expected, tp.getMaxBackoffMs());
+    }
+
+    @Test
+    void maxRetriesOneMeansOneInitialPlusOneRetry() {
+        // Verifies the documented semantics: max.retries = N means N retries AFTER the initial,
+        // for N+1 total attempts.
+        TestProvider tp = new TestProvider();
+        tp.configureRetryForTest(Map.of(
+                AbstractKubernetesConfigProvider.MAX_RETRIES_CONFIG_NAME, "1",
+                AbstractKubernetesConfigProvider.INITIAL_BACKOFF_MS_CONFIG_NAME, "5",
+                AbstractKubernetesConfigProvider.MAX_BACKOFF_MS_CONFIG_NAME, "10"
+        ));
+        AtomicInteger sleeps = new AtomicInteger();
+        tp.setSleeper(ms -> sleeps.incrementAndGet());
+
+        // Two transient errors → first sleeps (retry once), second is the final attempt.
+        Queued queued = new Queued()
+                .enqueue(transientGoaway())
+                .enqueue(transient503());
+
+        assertThrows(ConfigException.class, () -> tp.getResourceWithRetry(id(), queued));
+        assertEquals(1, sleeps.get(), "maxRetries=1 should sleep exactly once");
+    }
+
     // ─── helpers ────────────────────────────────────────────────────────────────────
 
     private static ConfigMap configMap() {
@@ -241,7 +295,8 @@ class AbstractKubernetesConfigProviderRetryTest {
     }
 
     private static KubernetesResourceIdentifier id() {
-        return new KubernetesResourceIdentifier("foo", "kafka");
+        // Constructor is (namespace, name); match the ConfigMap built in configMap().
+        return new KubernetesResourceIdentifier("kafka", "foo");
     }
 
     private static KubernetesClientException transientGoaway() {

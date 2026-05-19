@@ -15,7 +15,7 @@ final class KubernetesResourceIdentifier {
     private final String name;
 
     // Package-private to allow direct construction from unit tests (e.g. for the retry test
-     // which bypasses path parsing). Production code paths must go through fromConfigString.
+    // which bypasses path parsing). Production code paths must go through fromConfigString.
     KubernetesResourceIdentifier(String namespace, String name) {
         this.namespace = namespace;
         this.name = name;
