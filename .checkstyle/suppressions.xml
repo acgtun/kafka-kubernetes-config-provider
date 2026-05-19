@@ -5,5 +5,10 @@
         "http://www.puppycrawl.com/dtds/suppressions_1_1.dtd">
 
 <suppressions>
-  <!-- No suppressions here -->
+  <!-- Retry classification test references several JDK exception types and a few test helpers,
+       which trips ClassDataAbstractionCoupling. The coupling is inherent to the test surface
+       (we cover SocketException/SocketTimeoutException/UnknownHostException/EOFException/etc.)
+       and not a code smell. -->
+  <suppress files="AbstractKubernetesConfigProviderRetryTest.java"
+            checks="ClassDataAbstractionCoupling"/>
 </suppressions>
